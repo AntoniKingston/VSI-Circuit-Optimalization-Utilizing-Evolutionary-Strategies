@@ -1,0 +1,3 @@
+1. distrobox enter matlab-ubuntu -- bash --noprofile --norc
+2. ~/matlab/bin/matlab -nodesktop -nosplash
+3. matlab.engine.shareEngine('ubuntu_matlab')
