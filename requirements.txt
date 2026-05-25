@@ -30,6 +30,7 @@ stack-data==0.6.3
 tornado==6.5.5
 traitlets==5.15.0
 wcwidth==0.7.0
+cma>=4.0.0
 asttokens==3.0.1
 comm==0.2.3
 debugpy==1.8.20
@@ -61,3 +62,4 @@ stack-data==0.6.3
 tornado==6.5.5
 traitlets==5.15.0
 wcwidth==0.7.0
+cma>=4.0.0
