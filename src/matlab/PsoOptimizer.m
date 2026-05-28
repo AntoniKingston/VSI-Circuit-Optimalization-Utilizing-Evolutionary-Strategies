@@ -27,7 +27,7 @@ classdef PsoOptimizer < handle
       obj.best_fitness_mat_ = zeros(obj.params_.max_iter, 1);
 
       pop_center = mean(obj.bounds_.space_range, 2);
-      pop_range = range(obj.bounds_.space_range, 2) * obj.params_.rang_coef;
+      pop_range = (max(obj.bounds_.space_range, [], 2) - min(obj.bounds_.space_range, [], 2)) * obj.params_.rang_coef;
 
       % Initialization of the swarm
       % (:,1,:) Position
@@ -57,7 +57,13 @@ classdef PsoOptimizer < handle
       [~, gbest] = min(obj.population_(:, 4, 1));
       obj.best_point_ = gbest;
       gbest_val = obj.population_(obj.best_point_, 4, 1);
-      disp(['Iteration: ' num2str(iter_num) '  Fitness: ' num2str(fitness_values(obj.best_point_)) ' Fitness(best): ' num2str(gbest_val)]);
+      if mod(iter_num, obj.params_.info_interval) == 0
+          best_solution = squeeze(obj.population_(obj.best_point_, 3, :))';
+          disp(['Iteration: ' num2str(iter_num) ...
+                '  Fitness: ' num2str(fitness_values(obj.best_point_)) ...
+                ' Fitness(best): ' num2str(gbest_val) ...
+                ' Best solution: ' mat2str(best_solution, 6)]);
+      end
     end
 
     function update_parameters(obj) 

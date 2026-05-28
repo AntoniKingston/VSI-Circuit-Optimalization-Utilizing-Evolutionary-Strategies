@@ -3,16 +3,34 @@ import subprocess
 from dataclasses import dataclass, field
 import numpy as np
 from enum import Enum
-import cma
+import re
+from pathlib import Path
+import io
+import sys
+try:
+    import cma
+except ImportError:
+    cma = None
+try:
+    import matlab.engine
+except ImportError:
+    matlab = None
 
 # Function works only if server is already running
 def compute_fitness(individual: List[float], opt_domain_pos_len: int = 4, client_script_name: str = "client.py") -> float:
     individual = individual[:opt_domain_pos_len]
-    data_str = " ".join(map(str, individual), )
-    cmd = f"python {client_script_name} -d {data_str}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    out_str = result.stdout
-    return float(out_str.split(" ")[4])
+    cmd = ["python", client_script_name, "-d", *map(str, individual)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    out_str = result.stdout.strip()
+    err_str = result.stderr.strip()
+    match = re.search(r"Objective function value = ([^\s]+)", out_str)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError(
+            "Failed to evaluate fitness via XML-RPC client. "
+            f"cmd={' '.join(cmd)} | returncode={result.returncode} | "
+            f"stdout={out_str!r} | stderr={err_str!r}"
+        )
+    return float(match.group(1))
 
 def initiate_population(n_individuals: int, initial_dist: Callable[[], List[float]], initial_hyperparam_values: List[float]) -> List[List[float]]:
     population = []
@@ -28,25 +46,52 @@ def crossover(parent_1: List[float], parent_2: List[float]) -> List[float]:
     child = parent_1[:crossover_point] + parent_2[crossover_point:]
     return child
 
-def mutate(individual: List[float], mutation_dist: Callable[[List, Dict[str, int]], Callable[[], List[float]]], hyperparam_mutation_dists: List[Callable[[], float]], hyperparam_name_to_id_dict: Dict[str, int]) -> List[float]:
+def mutate(
+    individual: List[float],
+    mutation_dist: Callable[[List, Dict[str, int]], Callable[[], List[float]]],
+    hyperparam_mutation_dists: List[Callable[[], float]],
+    hyperparam_name_to_id_dict: Dict[str, int],
+    search_space_limits: Optional[List[Tuple[float, float]]] = None,
+) -> List[float]:
     opt_domain_pos_len = len(individual) - len(hyperparam_mutation_dists)
     opt_domain = individual[:opt_domain_pos_len]
     hyperparam_domain = individual[opt_domain_pos_len:]
-    mutation_dist_f = mutation_dist(opt_domain, hyperparam_name_to_id_dict)
-    opt_domain += mutation_dist_f()
+    mutation_dist_f = mutation_dist(hyperparam_domain, hyperparam_name_to_id_dict)
+    opt_domain = list(np.asarray(opt_domain) + np.asarray(mutation_dist_f()))
+    if search_space_limits:
+        opt_domain = _clip_to_bounds(opt_domain, search_space_limits)
     for i, hyperparam_mutation_dist in enumerate(hyperparam_mutation_dists):
-        hyperparam_domain[i] += float(hyperparam_mutation_dist())
+        if hyperparam_name_to_id_dict.get("sigma") == i:
+            hyperparam_domain[i] *= float(hyperparam_mutation_dist())
+            hyperparam_domain[i] = float(np.clip(hyperparam_domain[i], 1e-8, 10.0))
+        else:
+            hyperparam_domain[i] += float(hyperparam_mutation_dist())
     return list(opt_domain) + list(hyperparam_domain)
 
 # We allow for no crossover (crossover between identical parents)
-def create_children(parents: List[List[float]], n_children: int, mutation_dist: Callable[[List, Dict[str, int]], Callable[[], List[float]]], hyperparam_mutation_dists: List[Callable[[], float]], hyperparam_name_to_id_dict: Dict[str, int]) -> List[List[float]]:
+def create_children(
+    parents: List[List[float]],
+    n_children: int,
+    mutation_dist: Callable[[List, Dict[str, int]], Callable[[], List[float]]],
+    hyperparam_mutation_dists: List[Callable[[], float]],
+    hyperparam_name_to_id_dict: Dict[str, int],
+    search_space_limits: Optional[List[Tuple[float, float]]] = None,
+) -> List[List[float]]:
     children = []
     for _ in range(n_children):
         id_1, id_2 = np.random.choice(len(parents), 2, replace=False)
         parent_1 = parents[id_1]
         parent_2 = parents[id_2]
         child = crossover(parent_1, parent_2) if np.random.random() < 0.9 else parent_1
-        children.append(mutate(child, mutation_dist, hyperparam_mutation_dists, hyperparam_name_to_id_dict))
+        children.append(
+            mutate(
+                child,
+                mutation_dist,
+                hyperparam_mutation_dists,
+                hyperparam_name_to_id_dict,
+                search_space_limits,
+            )
+        )
 
     return children
 
@@ -99,7 +144,18 @@ def optimize(config: ESConfig) -> Tuple[float, List[float]]:
     population = initiate_population(config.mu, config.initial_pop_dist_f, [config.sigma_0])
     print(f"Iteration: {0} | Best Fitness: {compute_fitness(population[0], config.dim, config.client_script_name)}")
     for i in range(1, config.n_iterations+1):
-        population = select_best_fits(create_children(population, config.lamb, config.opt_domain_mutation_dist, [config.sigma_mutation_dist_f], config.hyperparam_name_to_id_dict), config.mu, lambda individual:compute_fitness(individual, config.dim, config.client_script_name))
+        population = select_best_fits(
+            create_children(
+                population,
+                config.lamb,
+                config.opt_domain_mutation_dist,
+                [config.sigma_mutation_dist_f],
+                config.hyperparam_name_to_id_dict,
+                config.search_space_limits,
+            ),
+            config.mu,
+            lambda individual: compute_fitness(individual, config.dim, config.client_script_name),
+        )
         if i % config.opt_info_interval == 0:
             print(f"Iteration: {i} | Best Fitness: {compute_fitness(population[0], config.dim, config.client_script_name)}")
     return compute_fitness(population[0]), population[0]
@@ -274,8 +330,29 @@ class CMAESConfig:
             raise ValueError(f"x0 must have length {self.dim}, got {len(self.x0)}")
 
 
+@dataclass
+class PSOMatlabConfig:
+    matlab_script_name: str = "main"
+    matlab_source_dir: str = "src/matlab"
+    matlab_command: str = "matlab"
+    matlab_flags: Optional[List[str]] = None
+    working_directory: str = "."
+    use_shared_engine: bool = True
+    shared_engine_name: str = "ubuntu_matlab"
+    max_iter: int = 50
+    particle_number: int = 100
+    opt_info_interval: int = 10
+    echo_logs: bool = True
+
+    def __post_init__(self):
+        if self.matlab_flags is None:
+            self.matlab_flags = ["-nodesktop", "-nosplash", "-nojvm", "-batch"]
+
+
 def optimize_cma_es(config: CMAESConfig) -> Tuple[float, List[float]]:
     """CMA-ES via pycma with box constraints on the optimization domain."""
+    if cma is None:
+        raise ImportError("CMA-ES requires package 'cma'. Install it with: pip install cma")
     fitness_fn = lambda individual: compute_fitness(
         individual, config.dim, config.client_script_name
     )
@@ -310,3 +387,89 @@ def optimize_cma_es(config: CMAESConfig) -> Tuple[float, List[float]]:
 
     best_solution = list(es.result.xbest)
     return float(es.result.fbest), best_solution
+
+
+def optimize_pso_matlab(config: PSOMatlabConfig) -> Tuple[float, str]:
+    """
+    Run MATLAB PSO optimizer from src/matlab and return best fitness and full stdout.
+
+    The function expects PSO logs to contain lines like:
+    'Iteration: <k>  Fitness: <...> Fitness(best): <value>'
+    """
+    source_dir = str((Path(config.working_directory) / config.matlab_source_dir).resolve())
+    captured_stdout = ""
+
+    class _TeeWriter(io.StringIO):
+        def __init__(self, stream):
+            super().__init__()
+            self._stream = stream
+
+        def write(self, s):
+            if config.echo_logs and self._stream is not None:
+                self._stream.write(s)
+                self._stream.flush()
+            return super().write(s)
+
+    if config.use_shared_engine:
+        if matlab is None:
+            raise ImportError(
+                "Shared MATLAB engine mode requires package 'matlabengine'. "
+                "Install it or set use_shared_engine=False."
+            )
+        try:
+            eng = matlab.engine.connect_matlab(config.shared_engine_name)
+            eng.addpath(source_dir, nargout=0)
+            out_tee = _TeeWriter(sys.stdout)
+            err_tee = _TeeWriter(sys.stderr)
+            eng.cd(source_dir, nargout=0)
+            eng.feval(
+                config.matlab_script_name,
+                int(config.max_iter),
+                int(config.particle_number),
+                int(config.opt_info_interval),
+                nargout=0,
+                stdout=out_tee,
+                stderr=err_tee,
+            )
+            stdout = out_tee.getvalue()
+            captured_stdout = stdout
+        except Exception as err:
+            raise RuntimeError(
+                "MATLAB PSO execution via shared engine failed. "
+                f"engine={config.shared_engine_name!r} | expr={config.matlab_script_name!r} | error={err}"
+            ) from err
+        stderr = ""
+        returncode = 0
+    else:
+        flags = config.matlab_flags or ["-nodesktop", "-nosplash", "-nojvm", "-batch"]
+        batch_expr = (
+            f"cd('{source_dir}'); "
+            f"{config.matlab_script_name}({int(config.max_iter)},"
+            f"{int(config.particle_number)},{int(config.opt_info_interval)})"
+        )
+        cmd = [config.matlab_command, *flags, batch_expr]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=config.working_directory,
+        )
+        stdout = result.stdout or ""
+        captured_stdout = stdout
+        stderr = result.stderr or ""
+        returncode = result.returncode
+        if config.echo_logs and stdout:
+            print(stdout, end="")
+
+    fitness_matches = re.findall(r"Fitness\(best\):\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", captured_stdout)
+    if returncode != 0:
+        raise RuntimeError(
+            "MATLAB PSO execution failed. "
+            f"returncode={returncode} | stdout={stdout!r} | stderr={stderr!r}"
+        )
+    if not fitness_matches:
+        raise RuntimeError(
+            "MATLAB PSO execution succeeded but no 'Fitness(best)' was found in logs. "
+            f"stdout={stdout!r} | stderr={stderr!r}"
+        )
+    return float(fitness_matches[-1]), captured_stdout
