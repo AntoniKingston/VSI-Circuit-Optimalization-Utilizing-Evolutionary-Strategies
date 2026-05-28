@@ -135,7 +135,7 @@ class ESConfig:
         if not self.hyperparam_name_to_id_dict:
             self.hyperparam_name_to_id_dict = {"sigma": 0}
         if not self.search_space_limits:
-            self.search_space_limits = [(-1, 1) for _ in range(self.dim)]
+            self.search_space_limits = [(-10, 10) for _ in range(self.dim)]
         self.initial_pop_dist_f = self.initial_pop_dist(self.dim, self.search_space_limits)
         if not self.opt_domain_mutation_dist:
             self.opt_domain_mutation_dist = lambda hyperparam_domain, hyperparam_name_to_id_dict: DistributionMaker.MULTIVARIATE_NORMAL(np.zeros(self.dim), np.eye(self.dim) * hyperparam_domain[hyperparam_name_to_id_dict["sigma"]])
@@ -228,7 +228,7 @@ class JDEConfig:
         if not self.hyperparam_name_to_id_dict:
             self.hyperparam_name_to_id_dict = {"F": 0, "CR": 1}
         if not self.search_space_limits:
-            self.search_space_limits = [(-1, 1) for _ in range(self.dim)]
+            self.search_space_limits = [(-10, 10) for _ in range(self.dim)]
         self.initial_pop_dist_f = self.initial_pop_dist(self.dim, self.search_space_limits)
 
 
@@ -325,7 +325,7 @@ class CMAESConfig:
 
     def __post_init__(self):
         if not self.search_space_limits:
-            self.search_space_limits = [(-1, 1) for _ in range(self.dim)]
+            self.search_space_limits = [(-10, 10) for _ in range(self.dim)]
         if self.x0 is not None and len(self.x0) != self.dim:
             raise ValueError(f"x0 must have length {self.dim}, got {len(self.x0)}")
 
