@@ -1,0 +1,51 @@
+[general]
+# Where to store all outputs (csv + debug txt)
+output_dir = results
+debug_log_file = run_debug.txt
+progress_file = progress.json
+run_label = vsi-main-grid
+
+# Output files
+detailed_results_file = detailed_results.csv
+summary_file = summary_results.csv
+trajectory_file = trajectories.csv
+save_trajectories = 1
+max_workers = 6
+# By default PSO is serial to avoid contention on shared MATLAB engine.
+parallel_pso = 0
+
+# Experiments
+algorithms = es,jde,cma,pso
+budgets = 1000,2000,5000
+seeds = 1,2,3,4,5
+
+# Which summary stats to compute
+stats = mean,median,std,min,max,q1,q3
+
+# XML-RPC client used by ES/jDE/CMA
+client_script_name = client.py
+
+[grid.es]
+mu = 10,20,40
+lamb = 30,100,200
+sigma_0 = 0.1,0.3,0.7
+sigma_sigma = 0.03,0.1,0.2
+
+[grid.jde]
+population_size = 20,40,80
+F_init = 0.4,0.5,0.7
+CR_init = 0.5,0.8,0.9
+tau = 0.05,0.1,0.2
+
+[grid.cma]
+sigma_0 = 0.1,0.3,0.5
+popsize = 8,16
+
+[grid.pso]
+particle_number = 20,40,80
+info_interval = 10
+c1 = 1.7,2.05,2.5
+c2 = 1.5,2.05
+rang_coef = 0.4,0.6,0.8
+# 1 = print MATLAB logs to notebook/stdout, 0 = quiet
+echo_logs = 0
