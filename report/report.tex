@@ -1,0 +1,606 @@
+% Final report — WdAE project (task 24), Springer Nature template
+% Compile from the report/ directory: pdflatex report.tex
+
+\documentclass[pdflatex,sn-mathphys-num]{sn-jnl}
+
+\usepackage{graphicx}%
+\usepackage{amsmath,amssymb,amsfonts}%
+\usepackage{booktabs}%
+\usepackage{hyperref}%
+\hypersetup{hidelinks}%
+
+\raggedbottom
+
+\begin{document}
+
+\title[VSI Circuit Optimization with Evolutionary Strategies]{%
+  Optimization of a Voltage-Source Inverter Control System Using Evolutionary Strategies and Differential Evolution}
+
+\author*[1]{\fnm{Antoni} \sur{Kingston}}%
+
+\author[1]{\fnm{Marcel} \sur{Wronkowski}}%
+\equalcont{These authors contributed equally to this work.}
+
+\affil*[1]{%
+  \orgdiv{Faculty Mathematics and Information Sciences},%
+  \orgname{Warsaw University of Technology},%
+}
+
+\abstract{%
+  Tuning discrete-time DLQR weights for a voltage-source inverter is posed as a four-dimensional black-box minimization problem.
+  A MATLAB simulator returns a scalar cost from closed-loop time-domain evaluation; unstable designs are penalized.
+  We compare $(\mu,\lambda)$ evolution strategy, self-adaptive differential evolution (jDE), covariance-matrix adaptation evolution strategy (CMA-ES), and a native particle-swarm optimization baseline under matched function-evaluation budgets $B\in\{50,100,200\}$, with reproducible batch runs and non-parametric tests (Mann--Whitney with Holm correction, Wilcoxon, Friedman) on configurations tuned at $B=50$.
+  Descriptively, jDE and CMA-ES reach fitness near $0.018$, whereas PSO remains near $0.15$ and does not improve when $B$ increases.
+  jDE is the most stable across seeds; CMA-ES requires $B\ge100$ to match jDE on tuned settings; evolution strategy runs show occasional severe outliers.
+  With only five seeds per tuned configuration, Holm-corrected tests support jDE and CMA-ES over PSO at $B=100$ and $B=200$, but not evolution strategy versus PSO, and no test confirms a benefit from larger $B$.
+  We recommend jDE for robustness or CMA-ES when wall-clock cost matters at moderate budgets, and treat PSO as a fast but suboptimal reference on this simulator.
+}
+
+\keywords{evolutionary computation, evolution strategies, differential evolution, CMA-ES, particle swarm optimization, voltage-source inverter, black-box optimization}
+
+\maketitle
+
+%%======================================================================
+\section{Introduction}\label{sec:introduction}
+%%======================================================================
+
+Grid-connected voltage-source inverters (VSIs) with $LC$ output filters must provide accurate reference tracking while limiting control effort and respecting actuator limits.
+A common design approach combines a state-feedback regulator with weighting matrices $Q$ and $R$ that trade off error suppression against input activity.
+For the discrete-time DLQR structure used in our simulator, these weights are not chosen by hand: they are obtained from a candidate parameter vector that defines diagonal penalties on plant, input, and resonant states before each closed-loop run.
+Because each trial requires solving an algebraic Riccati equation and simulating the nonlinearities introduced by saturation and instability checks, the mapping from parameters to performance is expensive, non-smooth, and not available in closed form.
+
+Derivative-free optimizers are a natural match for such settings.
+Evolution strategies and differential evolution explore the search space through populations and mutations without gradients; covariance-matrix adaptation evolution strategy (CMA-ES) models variable interactions through an adapting Gaussian distribution; particle swarm optimization (PSO) provides a widely used engineering baseline.
+The WdAE project task examined exactly this scenario: tune a four-dimensional weight vector for a supplied VSI simulator, compare evolutionary methods with PSO, and report reproducible numerical results with appropriate statistical tests.
+
+In this work we implement and benchmark three Python-based optimizers---a $(\mu,\lambda)$ evolution strategy with self-adapted step size, jDE (DE/rand/1/bin with adaptive $F$ and $\mathrm{CR}$), and CMA-ES via \texttt{pycma}---against the MATLAB PSO routine bundled with the simulator.
+All methods minimize the same scalar fitness $f(\mathbf{p})$ (Section~\ref{sec:problem}) under explicit function-evaluation budgets $B\in\{50,100,200\}$.
+Python algorithms query fitness through an XML-RPC server; PSO evaluates $f$ natively inside MATLAB.
+Hyperparameters are explored on coarse grids; representative configurations are selected on the smallest budget and analysed across all~$B$.
+Non-parametric tests (Mann--Whitney with Holm correction, paired Wilcoxon tests, Friedman test on matched seeds) are applied with $n=5$ seeds per tuned setting, and outcomes are reported without overstating significance where sample size limits power.
+
+The study addresses three practical questions:
+\begin{enumerate}
+  \item Can evolutionary methods consistently reach lower fitness than the PSO baseline under equal evaluation budgets?
+  \item Among ES, jDE, and CMA-ES, which method offers the best trade-off between final fitness, robustness across seeds, and wall-clock time?
+  \item Does increasing $B$ from $50$ to $200$ still improve controller quality once a good weight vector has been found?
+\end{enumerate}
+
+Our contributions are:
+\begin{itemize}
+  \item a unified experimental harness (\texttt{run\_experiments.py}) with CSV logging, optional trajectories, and parallel execution for non-PSO methods;
+  \item corrected integration of PSO hyperparameters and random seeds through \texttt{PSOMatlabConfig} and \texttt{main.m};
+  \item a full grid study on the provided simulator with analysis scripts for figures and statistics;
+  \item an honest discussion of where differences are statistically supported versus merely descriptive (Sections~\ref{sec:results}--\ref{sec:conclusions}).
+\end{itemize}
+
+The remainder of the report is organized as follows.
+Section~\ref{sec:problem} formalizes the simulator, decision variables, and cost function.
+Section~\ref{sec:algorithms} describes each optimizer and its coupling to the evaluation budget.
+Section~\ref{sec:methodology} documents grids, seeds, and testing procedures.
+Section~\ref{sec:results} presents fitness distributions, tuned-configuration tables, and runtime behaviour.
+Sections~\ref{sec:discussion} and~\ref{sec:conclusions} interpret the findings and state recommendations.
+Section~\ref{sec:deviations} records differences from the preliminary WdAE project plan.
+Reproduction instructions are given in the public repository \url{https://github.com/AntoniKingston/VSI-Circuit-Optimalization-Utilizing-Evolutionary-Strategies} (\texttt{README.md}).
+
+%%======================================================================
+\section{Problem formulation}\label{sec:problem}
+%%======================================================================
+
+We study the task of tuning a discrete-time DLQR controller for a three-phase voltage-source inverter (VSI) with an $LC$ output filter.
+The plant, reference generator, resonant augmentation, and closed-loop simulation are provided as a MATLAB black-box evaluator.
+The optimizer does not access model Jacobians or cost gradients; it may only query a scalar fitness for candidate weighting vectors.
+
+\subsection{Plant, augmentation, and DLQR control}\label{subsec:plant}
+
+The averaged VSI dynamics are modelled in the $\alpha\beta$ frame as a linear continuous-time state-space system with states associated with filter inductor currents and capacitor voltages, and two control inputs.
+The model is discretized by zero-order hold at sampling period $T_s = 1/(2 f_{\mathrm{sw}})$, where $f_{\mathrm{sw}}$ is the switching frequency.
+Input delay is represented by augmenting the state with previous actuation values, and harmonic tracking is introduced through resonant states driven by the tracking error (one harmonic at grid frequency in the default configuration).
+
+For a candidate parameter vector $\mathbf{p} \in \mathbb{R}^4$, the simulator constructs diagonal weighting matrices $Q(\mathbf{p})$ and $R(\mathbf{p})$ and solves the discrete-time algebraic Riccati equation to obtain a stabilizing gain matrix $K(\mathbf{p})$.
+The gain is decomposed into components $(K_x, K_u, K_r)$ acting on the plant state, delayed input, and resonant states, respectively.
+At each discrete time step $k$, the controller computes
+\begin{equation}
+  \mathbf{u}_k = -K_r \mathbf{x}_{r,k} - K_u \mathbf{x}_{u,k} - K_x \mathbf{x}_k,
+  \label{eq:control-law}
+\end{equation}
+with actuation saturated to the DC-link limits $\pm V_{\mathrm{dc}}$.
+The closed-loop state is advanced using the augmented discrete matrices $(A_d, B_d)$ supplied by the simulator configuration (filter parameters $L_f$, $C_f$, $R_f$, bus voltage, simulation horizon, and penalty weight $\beta_c$).
+
+Before simulation, the spectral radius of the closed-loop matrix $A_{\mathrm{cl}} = A_{d,\mathrm{aug}} - B_{d,\mathrm{aug}} K$ is checked.
+If $\rho(A_{\mathrm{cl}}) \ge 1$, the candidate is rejected with a large penalty fitness (numerically $10^6$), as it corresponds to an unstable or marginally unstable discrete-time loop.
+
+\subsection{Decision variables and feasible set}\label{subsec:variables}
+
+The optimization vector $\mathbf{p} = (p_1,\ldots,p_4)^{\mathsf{T}}$ encodes DLQR weights in \emph{logarithmic design coordinates}.
+Each component is mapped to positive diagonal entries of $Q$ through $10^{p_j}$, following the structure implemented in \texttt{calculate\_k\_matrix.m}:
+two components govern state penalties on the tracked $\alpha\beta$ output, one component scales control-input penalties, and one component sets the weight of the resonant (harmonic) states.
+With \texttt{R\_mode = 0} in the default simulator setup, the input-cost matrix $R$ is fixed and not part of the search; only $Q$ is tuned.
+
+In the evolutionary and CMA-ES experiments, each $p_j$ is constrained to the box
+\begin{equation}
+  p_j \in [-10,\, 10], \qquad j = 1,\ldots,4,
+  \label{eq:box-constraints}
+\end{equation}
+and candidate vectors are clipped to this set before evaluation.
+The particle-swarm baseline uses the native bound generation of the MATLAB optimizer (component-wise limits derived from \texttt{Qmax} in the simulator parameters, typically $[-4,4]$ per dimension), which defines a slightly different feasible set; algorithm comparisons therefore refer to the same fitness oracle but not necessarily to identical box constraints across methods.
+
+\subsection{Objective function}\label{subsec:objective}
+
+For a stabilizing parameter vector $\mathbf{p}$, fitness is the time-average quadratic cost computed over a fixed horizon $T_{\mathrm{sim}}$ with $N = \lfloor T_{\mathrm{sim}} / T_s \rfloor$ steps.
+Let $\mathbf{e}_k \in \mathbb{R}^{n_u}$ denote the tracking error between the reference and the selected outputs at step $k$, and $\Delta \mathbf{u}_k$ the increment of the (saturated) control input.
+The simulator returns
+\begin{equation}
+  f(\mathbf{p}) = \frac{1}{N} \sum_{k=1}^{N} \left( \|\mathbf{e}_k\|_2^2 + \beta_c \|\Delta \mathbf{u}_k\|_2^2 \right),
+  \label{eq:cost}
+\end{equation}
+where $\beta_c > 0$ penalizes aggressive control moves.
+The reference is a smooth step in the $\alpha\beta$ frame with amplitude $V_{\mathrm{ref}}$ and settling time constant derived from $t_{\mathrm{settling}}$.
+Lower fitness values indicate better tracking with moderate control effort.
+
+Failed numerical operations (e.g.\ DLQR design failure or simulation exception) and unstable closed loops are mapped to the same large penalty value, which shapes the feasible landscape seen by the optimizers without explicit constraint handling beyond clipping in $\mathbf{p}$.
+
+\subsection{Black-box optimization problem}\label{subsec:bbo}
+
+The engineering goal is to minimize fitness subject to implicit stability and simulator-side validity:
+\begin{equation}
+  \mathbf{p}^{\star} \in \arg\min_{\mathbf{p} \in \mathcal{P}} f(\mathbf{p}),
+  \label{eq:problem}
+\end{equation}
+where $\mathcal{P} \subset \mathbb{R}^4$ is the box in \eqref{eq:box-constraints} (or the PSO-specific bounds for the baseline).
+The mapping $\mathbf{p} \mapsto f(\mathbf{p})$ is deterministic for a fixed random seed in the stochastic optimizers, but it is nonconvex, non-smooth in practice because of penalties and saturation, and expensive: each evaluation requires building $(Q,R)$, solving DLQR, and running the full time-domain simulation.
+
+Algorithms are compared under a common \emph{function evaluation budget} (FES): one evaluation equals one call to the XML-RPC \texttt{evaluate} interface (Python \texttt{client.py} forwarding $\mathbf{p}$ to the MATLAB server on \texttt{127.0.0.1:8484}), which internally executes the pipeline in \texttt{DLQREvaluator.evaluate}.
+This ensures that ES, jDE, CMA-ES, and PSO incur comparable oracle costs even though their internal iteration structure differs.
+
+\subsection{Modelling assumptions relevant to the study}\label{subsec:assumptions}
+
+The following assumptions follow directly from the provided simulator and from the experimental protocol used later in this report:
+\begin{itemize}
+  \item \textbf{No analytical gradient.} Optimizers treat $f$ as a black box; no adjoint or sensitivity model is available.
+  \item \textbf{No certified global optimum.} The best achievable fitness is unknown a priori; improvements are assessed empirically across algorithms and seeds.
+  \item \textbf{Deterministic oracle.} For a given $\mathbf{p}$ and fixed simulator data, $f(\mathbf{p})$ is reproducible; stochasticity enters only through the search algorithms (and optional RNG seeding in PSO).
+  \item \textbf{Penalty-dominated failures.} Unstable or infeasible designs are not distinguished by separate constraint violations; they collapse to the same scalar penalty, which can create flat or deceptive regions in the search space.
+  \item \textbf{Fixed plant and scenario.} Filter parameters, horizon, reference profile, and $\beta_c$ are held constant; the study isolates controller tuning rather than plant identification or robustness to parameter uncertainty.
+\end{itemize}
+
+Together, \eqref{eq:problem}--\eqref{eq:cost} define the optimization problem addressed by evolution strategies, adaptive differential evolution, CMA-ES, and the PSO reference implementation in the remainder of this work.
+
+%%======================================================================
+\section{Compared algorithms}\label{sec:algorithms}
+%%======================================================================
+
+We compare four derivative-free optimizers on the problem formulated in Section~\ref{sec:problem}:
+a $(\mu,\lambda)$ evolution strategy (ES) with self-adapted global step size, the \emph{jDE} variant of differential evolution, covariance-matrix adaptation evolution strategy (CMA-ES), and a particle-swarm optimization (PSO) routine supplied with the simulator.
+The first three are implemented in Python and query fitness through an XML-RPC client; PSO runs natively in MATLAB and calls the evaluator object directly.
+All methods search the same four-dimensional weight space $\mathbf{p}$, but they differ in population structure, adaptation mechanisms, and how a fixed evaluation budget~$B$ is translated into generations.
+
+\subsection{Common experimental interface}\label{subsec:common-interface}
+
+Let $B$ denote the FES allocated to a single run.
+For ES, jDE, and CMA-ES, one function evaluation is one invocation of \texttt{client.py}, which forwards $\mathbf{p}$ to the simulator server and returns $f(\mathbf{p})$.
+Candidate vectors are clipped to $[-10,10]^4$ before evaluation (Section~\ref{subsec:variables}).
+Python optimizers receive an independent pseudorandom seed per run; PSO additionally fixes the MATLAB RNG when a non-negative seed is passed to \texttt{main.m}.
+
+Table~\ref{tab:algo-mapping} summarizes how $B$ is mapped to iterations and which hyperparameters are tuned in the grid search (Section~\ref{sec:methodology}).
+The effective number of evaluations may deviate slightly from $B$ for ES because of initialization logging, but the design intent is to align methods to comparable oracle cost.
+
+\begin{table}[h]
+\caption{Algorithm families, tuned hyperparameters, and budget mapping for one run with FES~$B$.}\label{tab:algo-mapping}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Method & Tuned settings & Generations / iterations & Evaluations per cycle \\
+\midrule
+$(\mu,\lambda)$-ES & $\mu$, $\lambda$, $\sigma_0$, $\sigma_\sigma$ & $G=\lfloor B/\lambda\rfloor$ & $\lambda$ offspring \\
+jDE & $N_{\mathrm{pop}}$, $F_0$, $\mathrm{CR}_0$, $\tau$ & $G=\lfloor B/N_{\mathrm{pop}}\rfloor$ & $\le N_{\mathrm{pop}}$ trials \\
+CMA-ES & $\sigma_0$, $\mathrm{popsize}$ & until $B$ fevals & one population \\
+PSO & $N_{\mathrm{part}}$, $c_1$, $c_2$, $\rho_{\mathrm{rang}}$ & $G=\lfloor B/N_{\mathrm{part}}\rfloor$ & $N_{\mathrm{part}}$ particles \\
+\botrule
+\end{tabular}
+\end{table}
+
+\subsection{$(\mu,\lambda)$ evolution strategy}\label{subsec:es}
+
+\paragraph{General method.}
+Evolution strategies are stochastic search methods designed for continuous black-box optimization in $\mathbb{R}^n$.
+In the $(\mu,\lambda)$ selection scheme, $\mu$ parent individuals produce $\lambda$ offspring per generation ($\lambda\ge\mu$); only the offspring compete for survival, and the best $\mu$ become parents of the next generation.
+Mutation is typically applied in an isotropic or correlated manner; the step-size control parameter $\sigma$ is often self-adapted so that the search scale matches the local fitness landscape.
+
+\paragraph{Implementation and encoding.}
+Our implementation follows the $(\mu,\lambda)$ pattern with intermediate recombination and Gaussian mutation of the decision vector.
+Each individual stores the four weights $\mathbf{p}$ plus one strategy parameter $\sigma$ appended to the genotype.
+Fitness calls use only $\mathbf{p}$; $\sigma$ governs the magnitude of mutation and evolves by multiplicative log-normal perturbation with learning rate $\sigma_\sigma$:
+\begin{equation}
+  \sigma \leftarrow \sigma \cdot \exp\!\bigl(\mathcal{N}(0,\sigma_\sigma^2)\bigr),
+  \label{eq:sigma-adapt}
+\end{equation}
+with clipping to $[10^{-8},10]$ for numerical stability.
+Offspring are generated by:
+\begin{enumerate}
+  \item selecting two distinct parents uniformly at random;
+  \item applying one-point crossover with probability $0.9$ (otherwise cloning one parent);
+  \item adding $\mathcal{N}(\mathbf{0},\sigma^2 I_4)$ noise to $\mathbf{p}$ and adapting $\sigma$ as in \eqref{eq:sigma-adapt};
+  \item clipping $\mathbf{p}$ to the feasible box.
+\end{enumerate}
+The $\mu$ best offspring under $f$ form the next parent population.
+
+\paragraph{Application to the VSI problem.}
+For budget $B$, the runner sets $G=\max(1,\lfloor B/\lambda\rfloor)$ generations.
+Hyperparameters $\mu$, $\lambda$, initial step size $\sigma_0$, and $\sigma_\sigma$ are swept on a grid; each combination is run with multiple random seeds.
+Because unstable DLQR designs yield the flat penalty $10^6$, $\sigma$ adaptation can occasionally drive the strategy into aggressive mutations; clipping and parent--offspring selection mitigate but do not eliminate this risk.
+The method is well suited to moderate dimensionality ($n=4$) but has no explicit model of variable coupling beyond the diagonal Gaussian mutation.
+
+\subsection{Adaptive differential evolution (jDE)}\label{subsec:jde}
+
+\paragraph{General method.}
+Differential evolution (DE) maintains a population of $N_{\mathrm{pop}}$ candidate solutions and creates trials by combining scaled differences between existing members.
+The \texttt{rand/1/bin} variant draws three distinct indices $r_1,r_2,r_3$ and forms a mutant
+\begin{equation}
+  \mathbf{v} = \mathbf{x}_{r_1} + F\,(\mathbf{x}_{r_2}-\mathbf{x}_{r_3}),
+  \label{eq:de-mutant}
+\end{equation}
+then performs binomial crossover with crossover rate $\mathrm{CR}$ between $\mathbf{v}$ and the target $\mathbf{x}_i$, ensuring at least one component comes from the mutant.
+Greedy selection replaces $\mathbf{x}_i$ if the trial is not worse.
+
+\emph{jDE}~\cite{brest2006self} extends DE by encoding $F$ and $\mathrm{CR}$ in each individual and resetting them probabilistically each generation: with probability $\tau$ (per parameter), $F$ or $\mathrm{CR}$ is re-sampled uniformly from fixed intervals (here $F\in[0.1,1]$ and $\mathrm{CR}\in[0,1]$).
+This removes the need to hand-tune a single $(F,\mathrm{CR})$ pair across the VSI landscape.
+
+\paragraph{Implementation and encoding.}
+Each population member stores $(\mathbf{p},F,\mathrm{CR})$.
+For every target index $i$, the algorithm adapts $(F,\mathrm{CR})$, builds $\mathbf{v}$ via \eqref{eq:de-mutant}, applies binomial crossover, clips the trial to $[-10,10]^4$, and compares $f(\mathbf{p}_{\mathrm{trial}})$ with $f(\mathbf{p}_i)$.
+The population is initialized uniformly in the box; $F$ and $\mathrm{CR}$ are initialized to grid values $F_0$ and $\mathrm{CR}_0$ with adaptation intensity $\tau$ (shared for both parameters in our code).
+
+\paragraph{Application to the VSI problem.}
+With population size $N_{\mathrm{pop}}$, one generation performs at most $N_{\mathrm{pop}}$ new evaluations (fewer if trials are rejected before calling the oracle only when selection succeeds---in our implementation each accepted comparison requires one trial evaluation).
+The outer loop runs $G=\lfloor B/N_{\mathrm{pop}}\rfloor$ generations for budget $B$.
+jDE is attractive when the fitness landscape is multimodal: difference vectors can jump between basins in log-weight space.
+On the VSI task, penalty regions around unstable gains act as barriers; self-adaptive $F$ and $\mathrm{CR}$ moderate the step size when progress stalls.
+
+\subsection{Covariance-matrix adaptation ES (CMA-ES)}\label{subsec:cma}
+
+\paragraph{General method.}
+CMA-ES~\cite{hansen2001completely} adapts a multivariate normal search distribution $\mathcal{N}(\mathbf{m},\sigma^2 C)$ over generations.
+The mean $\mathbf{m}$ is updated by rank-weighted recombination of the best offspring; the step size $\sigma$ is controlled by cumulative step-length adaptation; and the covariance matrix $C$ captures variable interactions and scaling.
+The method is invariant to affine transformations of the search space (up to the initial $\sigma_0$ and population size) and is widely used on ill-conditioned black-box problems.
+
+\paragraph{Implementation.}
+We use the \texttt{pycma} reference implementation with box constraints enforced by passing lower and upper bounds $[-10,10]^4$.
+The initial mean is the centre of the box; initial step size $\sigma_0$ and population size $\mathrm{popsize}$ are configuration inputs (not evolved).
+The evolutionary loop follows the standard \texttt{ask--tell} pattern: sample $\lambda$ points, evaluate $f$, update the internal state, and stop when the evaluation count reaches $B$ (\texttt{maxfevals}$=B$).
+The random seed is passed into CMA-ES options for reproducibility.
+
+\paragraph{Application to the VSI problem.}
+CMA-ES is the only compared method that explicitly models correlations between log-weights, which may matter when state, input, and harmonic penalties interact through the closed loop.
+Because $n=4$, population sizes $\mathrm{popsize}\in\{8,16\}$ from the experimental grid are above the default minimum recommended by the theory, but still small compared to large-scale benchmark studies.
+The method does not use penalty-aware repair beyond bound clipping; unstable $\mathbf{p}$ still consume budget through $10^6$ evaluations.
+In practice CMA-ES often achieves low fitness with fewer effective evaluations than ES on similar black-box tasks, at the cost of higher per-iteration linear algebra overhead (negligible relative to the MATLAB simulation).
+
+\subsection{Particle swarm optimization (baseline)}\label{subsec:pso}
+
+\paragraph{General method.}
+PSO maintains a swarm of $N_{\mathrm{part}}$ particles with positions $\mathbf{x}_i$ and velocities $\mathbf{v}_i$ in the search space.
+Each particle remembers its personal best $\mathbf{p}_i$ and is attracted toward the global best $\mathbf{g}$ and its own history.
+With constriction-factor coefficients $c_1$, $c_2$, the velocity update uses
+\begin{equation}
+  \mathbf{v}_i \leftarrow \kappa\Bigl(\mathbf{v}_i + c_1 r_1 (\mathbf{p}_i-\mathbf{x}_i) + c_2 r_2(\mathbf{g}-\mathbf{x}_i)\Bigr),
+  \label{eq:pso-velocity}
+\end{equation}
+where $\kappa$ is derived from $c_1+c_2$ for stability, and $r_1,r_2\sim\mathcal{U}(0,1)$.
+Positions are updated and projected onto box constraints (absorbing walls zero velocity on boundary contact).
+
+\paragraph{Implementation.}
+The baseline \texttt{PsoOptimizer} class in \texttt{src/matlab} evaluates $f(\mathbf{p})$ through \texttt{DLQREvaluator.evaluate} inside a serial loop over particles (no parallel pool).
+Hyperparameters $c_1$, $c_2$, and $\rho_{\mathrm{rang}}$ (field \texttt{rang\_coef}) control cognitive/social attraction and the span of initial positions around the search-space centre.
+Function \texttt{main.m} sets the iteration count to $G=\lfloor B/N_{\mathrm{part}}\rfloor$, fixes the RNG seed per run, and returns the best fitness via \texttt{PSO\_FINAL\_FITNESS} in the log (also exposed as a MATLAB return value).
+
+\paragraph{Application to the VSI problem.}
+PSO serves as an engineering baseline shipped with the simulator rather than as a peer method implemented in the Python stack.
+Initial particle positions are drawn in a reduced box $[-4,4]^4$ (from \texttt{Qmax}), which is tighter than the $[-10,10]^4$ clipping used by the evolutionary methods---a methodological asymmetry to remember when interpreting comparisons.
+Each swarm iteration evaluates every particle once, so $B\approx G\cdot N_{\mathrm{part}}$.
+PSO does not adapt step-size statistics to the fitness landscape beyond velocity updates; on the VSI task it historically converges to markedly worse fitness than ES, jDE, or CMA-ES at the same budget, but at lower wall-clock cost because it avoids the XML-RPC subprocess overhead.
+
+\subsection{Summary of methodological choices}\label{subsec:algo-summary}
+
+All evolutionary methods treat $f$ as a minimization objective without explicit constraint handling beyond clipping and the simulator's stability check.
+They differ in exploration mechanism: ES mutates around elite parents with a scalar $\sigma$, jDE uses population differences with adaptive $(F,\mathrm{CR})$, CMA-ES learns a full covariance structure, and PSO performs velocity-based social search.
+For fair reporting, results in Section~\ref{sec:results} are organized by fixed $B$, tuned configuration, and seed; statistical tests operate on the resulting distributions of best fitness and runtime.
+
+%%======================================================================
+\section{Experimental methodology}\label{sec:methodology}
+%%======================================================================
+
+Experiments used FES budgets $B\in\{50,100,200\}$, seeds $\{1,\ldots,5\}$, and the hyperparameter grids in \texttt{experiments\_config.txt} (ES: $\mu\in\{10,20,40\}$, $\lambda\in\{20,50,100\}$; jDE: population size $\in\{10,20,40\}$; CMA-ES: $\mathrm{popsize}\in\{8,16\}$; PSO: $N_{\mathrm{part}}\in\{5,15,30\}$, etc.).
+Each algorithm--configuration--budget--seed tuple produced one row in \texttt{results/detailed\_results.csv}.
+For reporting, configurations were tuned by lowest median fitness on $B=50$ and evaluated at all budgets (Section~\ref{subsec:results-tuned}).
+Statistical analysis (\texttt{statistical\_tests.py}) comprised Mann--Whitney pairwise comparisons with Holm correction, paired Wilcoxon budget tests, Friedman tests on matched seeds, and Cliff's~$\delta$ effect sizes.
+PSO ran serially (\texttt{parallel\_pso=0}) on a shared MATLAB engine; other methods used parallel workers where configured.
+
+%%======================================================================
+\section{Results}\label{sec:results}
+%%======================================================================
+
+Experiments were executed with \texttt{run\_experiments.py} on the full hyperparameter grids of Section~\ref{sec:methodology}, FES budgets $B\in\{50,100,200\}$, and five random seeds per configuration.
+The run archive contains $3330$ detailed records in \texttt{results/detailed\_results.csv} (success rate above $98\%$ for ES/jDE/PSO; all CMA-ES runs completed).
+Below we report outcomes most relevant to the comparisons in Sections~\ref{sec:discussion} and~\ref{sec:conclusions}; additional sensitivity plots are available under \texttt{results/figures/}.
+
+\subsection{Overall fitness levels}\label{subsec:results-overall}
+
+Table~\ref{tab:fitness-pooled} lists \emph{descriptive} pooled medians over all grid configurations at each budget (not an inferential sample; configurations and seeds are pooled).
+Evolutionary methods often reach fitness of order $10^{-2}$, while PSO remains near $0.15$--$0.31$.
+At $B=200$, jDE and CMA-ES attain median $0.0183$; ES is slightly higher ($0.0190$) because of rare catastrophic outliers (Section~\ref{subsec:results-robustness}).
+At $B=50$, the pooled CMA-ES median ($0.36$) is even worse than PSO ($0.31$), so a small budget is not sufficient for reliable CMA-ES performance across the whole grid.
+
+\begin{table}[t]
+\centering
+\caption{Pooled median best fitness by algorithm and FES budget $B$ (all grid points, successful runs only). Descriptive summary; $n$ varies per cell (hundreds of runs per algorithm).}\label{tab:fitness-pooled}
+\large
+\setlength{\tabcolsep}{18pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{l r r r}
+\toprule
+Algorithm & $B=50$ & $B=100$ & $B=200$ \\
+\midrule
+ES        & 0.0250 & 0.0226 & 0.0190 \\
+jDE       & 0.0183 & 0.0183 & 0.0183 \\
+CMA-ES    & 0.355  & 0.0186 & 0.0183 \\
+PSO       & 0.309  & 0.153  & 0.149  \\
+\botrule
+\end{tabular}
+\normalsize
+\end{table}
+
+Figure~\ref{fig:boxplot-200} shows full distributions at the largest budget.
+Visually, many evolutionary runs cluster near $0.018$, whereas PSO occupies a separate band above $0.14$; this is a graphical pattern, not by itself a hypothesis test on tuned configurations.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figures/algorithm_fitness_boxplot_budget_200.pdf}
+\caption{Distribution of best fitness at $B=200$ over all hyperparameter configurations (log scale).}\label{fig:boxplot-200}
+\end{figure}
+
+\subsection{Tuned configurations}\label{subsec:results-tuned}
+
+For a per-method comparison, we selected the best hyperparameter set on the tuning budget $B=50$ (lowest median fitness over five seeds) and re-evaluated it at $B\in\{50,100,200\}$.
+Table~\ref{tab:fitness-tuned} summarizes these runs ($n=5$ seeds per cell---the inferential unit for the tests below).
+jDE is the most stable: median fitness stays at $0.01826$ across budgets.
+CMA-ES recovers after tuning once $B\ge100$.
+The selected ES configuration performs well at $B=50$ but \emph{degrades} when the budget increases (median $0.047$ at $B=200$).
+PSO under its tuned settings plateaus at $0.149$ independently of~$B$.
+
+\begin{table}[t]
+\centering
+\caption{Median best fitness for configurations tuned on $B=50$ and tested at each budget ($n=5$ seeds per cell).}\label{tab:fitness-tuned}
+\large
+\setlength{\tabcolsep}{18pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{l r r r}
+\toprule
+Algorithm & $B=50$ & $B=100$ & $B=200$ \\
+\midrule
+ES        & 0.0183 & 0.0304 & 0.0466 \\
+jDE       & 0.0183 & 0.0183 & 0.0183 \\
+CMA-ES    & 0.0302 & 0.0183 & 0.0183 \\
+PSO       & 0.149  & 0.149  & 0.149  \\
+\botrule
+\end{tabular}
+\normalsize
+\end{table}
+
+\paragraph{Statistical tests ($n=5$, tuned configurations).}
+Table~\ref{tab:stats-tuned} reports Mann--Whitney $U$ tests (two-sided) with Holm-adjusted $p$-values on the tuned series; this is the analysis aligned with our pre-registered plan, but with only five seeds per comparison the power is limited.
+At $B=200$: jDE and CMA-ES differ significantly from PSO ($p_{\mathrm{Holm}}\approx0.022$), and jDE/CMA-ES differ significantly from ES ($p_{\mathrm{Holm}}\approx0.045$) because ES medians are higher under the selected config.
+\emph{However, ES versus PSO at $B=200$ is not significant} ($p=0.119$, $p_{\mathrm{Holm}}=0.119$).
+At $B=50$, no pairwise comparison survives Holm correction at $\alpha=0.05$ (the smallest raw $p$ is jDE vs PSO, $0.011$, but $p_{\mathrm{Holm}}=0.067$).
+Friedman tests on matched seeds across the four tuned algorithms are non-significant at $B=50$ ($p=0.11$) but significant at $B=100$ and $B=200$ ($p\approx0.003$), indicating global differences only at larger budgets.
+Paired Wilcoxon tests for budget scaling ($50\to100\to200$ on the same seeds) are \emph{not} significant for any algorithm ($p\ge0.06$): we cannot claim that increasing $B$ improves tuned fitness in a statistically confirmed way.
+We deliberately do \emph{not} treat pooled grid-wide samples as confirmatory evidence: mixing hundreds of configurations inflates $n$ and yields artificially small $p$-values unrelated to the tuned-comparison design.
+
+\begin{table}[t]
+\centering
+\caption{Selected Mann--Whitney tests on tuned configurations ($n=5$ per group). Holm correction applied within each budget row. Significant at $\alpha=0.05$ shown in bold.}\label{tab:stats-tuned}
+\large
+\setlength{\tabcolsep}{10pt}
+\renewcommand{\arraystretch}{1.45}
+\begin{tabular}{l l l r r c}
+\toprule
+$B$ & Comparison & $p$ (raw) & $p_{\mathrm{Holm}}$ & Sig. \\
+\midrule
+50  & jDE vs PSO   & 0.011 & 0.067 & \\
+50  & CMA-ES vs PSO & 0.139 & 0.556 & \\
+50  & ES vs PSO    & 0.672 & 1.000 & \\
+\midrule
+100 & jDE vs PSO   & 0.007 & \textbf{0.045} & yes \\
+100 & CMA-ES vs PSO & 0.007 & \textbf{0.045} & yes \\
+100 & ES vs PSO    & 0.119 & 0.119 & \\
+\midrule
+200 & jDE vs PSO   & 0.007 & \textbf{0.045} & yes \\
+200 & CMA-ES vs PSO & 0.007 & \textbf{0.045} & yes \\
+200 & ES vs PSO    & 0.119 & 0.119 & \\
+200 & jDE vs ES    & 0.008 & \textbf{0.045} & yes \\
+\botrule
+\end{tabular}
+\normalsize
+\end{table}
+
+\subsection{Budget scaling}\label{subsec:results-budget}
+
+Figure~\ref{fig:budget-scaling} plots median--IQR fitness versus $B$ for the tuned configurations of Table~\ref{tab:fitness-tuned}.
+jDE and CMA-ES appear to stabilize near $0.018$ as $B$ grows; ES and PSO show flat or worsening medians under the chosen tuning protocol.
+Statistically, Wilcoxon signed-rank tests on matched seeds do not support a budget effect ($p\ge0.06$ for all algorithms): the descriptive trends in the figure should not be read as confirmed improvements from larger~$B$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{../results/figures/budget_scaling_median_iqr.pdf}
+\caption{Median and IQR of best fitness versus FES budget for tuned configurations.}\label{fig:budget-scaling}
+\end{figure}
+
+\subsection{Robustness and runtime}\label{subsec:results-robustness}
+
+ES produced severe outliers (fitness $\gg 1$) in $6\%$--$12\%$ of successful runs depending on~$B$, caused by unstable closed-loop trials penalized at $10^6$ but occasionally returning large finite costs before failure.
+jDE and tuned CMA-ES runs stayed close to the optimum except for isolated seeds.
+PSO never reached the evolutionary fitness band but showed low variance around its plateau.
+
+Wall-clock time (Figure~\ref{fig:runtime}) increases roughly linearly with~$B$ and is dominated by MATLAB simulation and XML-RPC overhead for Python methods.
+At $B=200$, median runtimes are approximately $3.5$\,s (PSO), $61$\,s (CMA-ES), $67$\,s (ES), and $149$\,s (jDE).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figures/runtime_boxplot.pdf}
+\caption{Wall-clock runtime per successful run (log scale), grouped by algorithm and budget.}\label{fig:runtime}
+\end{figure}
+
+%%======================================================================
+\section{Discussion}\label{sec:discussion}
+%%======================================================================
+
+The experiments indicate that tuning DLQR weights for the provided VSI simulator is a low-dimensional but harsh black-box problem: a narrow fitness valley near $f\approx0.01826$ coexist with a large penalty region and, for PSO, a separate local regime near $f\approx0.15$.
+
+\paragraph{Evolutionary methods versus PSO.}
+Descriptively, PSO under tuned settings stays near $f\approx0.15$ while jDE and CMA-ES reach $f\approx0.018$ (Table~\ref{tab:fitness-tuned}).
+Under the planned tests ($n=5$), jDE and CMA-ES are significantly better than PSO at $B=100$ and $B=200$ after Holm correction, but \textbf{not} ES versus PSO at $B=200$, and \textbf{no} comparison at $B=50$ survives Holm correction.
+We therefore state that PSO is empirically far from the best evolutionary fitness values, but the statistical evidence for dominance is method-specific and budget-dependent rather than universal across all evolutionary algorithms.
+Pooled summaries (Table~\ref{tab:fitness-pooled}) and Figure~\ref{fig:boxplot-200} illustrate the same separation graphically; they must not be quoted as confirmatory tests because they aggregate the full hyperparameter grid.
+Contributing factors include the tighter PSO search box ($[-4,4]^4$ versus $[-10,10]^4$) and different integration paths (native MATLAB vs XML-RPC).
+
+\paragraph{Comparison among ES, jDE, and CMA-ES.}
+Across the full grid, all three can reach fitness near $0.01826$, but the \emph{tuned} ES configuration selected on $B=50$ is significantly worse than jDE and CMA-ES at $B=100$ and $B=200$ ($p_{\mathrm{Holm}}\approx0.045$).
+At $B=200$, jDE and CMA-ES are also significantly different in the Mann--Whitney test ($p_{\mathrm{Holm}}\approx0.045$) despite nearly identical medians in Table~\ref{tab:fitness-tuned}---a consequence of very low seed-to-seed variance and $n=5$.
+jDE shows the best \emph{reliability} in Tables~\ref{tab:fitness-tuned}--\ref{tab:stats-tuned}: stable medians and no significant budget effect.
+CMA-ES is weak on the full grid at $B=50$ (Table~\ref{tab:fitness-pooled}) but matches jDE once tuned configs run at $B\ge100$.
+ES still produces the worst tail behaviour in pooled runs (Section~\ref{subsec:results-robustness}); oracle best-per-seed medians can match jDE, which shows that ES \emph{can} find the valley, but not reliably under the tuned settings reported here.
+
+\paragraph{Budget scaling and the fitness plateau.}
+Wilcoxon tests do not confirm that increasing $B$ improves tuned fitness for any algorithm.
+Descriptively, jDE and CMA-ES medians are already near $0.01826$ at $B=50$--$200$, while ES medians rise with $B$ under the selected config---a pattern that may reflect continued exploration of unstable weights rather than a validated budget benefit.
+We interpret the plateau as a property of the simulator landscape, but that interpretation rests on descriptive tables and non-significant Wilcoxon outcomes, not on rejected null hypotheses of improvement.
+
+\paragraph{Computational trade-offs.}
+PSO is fastest (Figure~\ref{fig:runtime}) but sacrifices solution quality.
+Among evolutionary candidates, CMA-ES offers the best quality-per-second at $B=200$; jDE is slowest because each generation performs up to $N_{\mathrm{pop}}$ sequential XML-RPC evaluations.
+The choice depends on whether wall-clock time or final fitness is binding.
+
+\paragraph{Limitations.}
+Only five seeds per configuration were run, below the $30+$ foreseen in the initial project plan, which limits statistical power for tuned-configuration tests.
+Results are conditional on the supplied simulator, fixed plant parameters, and grid choices; no claims are made about hardware-in-the-loop performance, THD, or overshoot metrics.
+Finally, configuration tuning used the lowest budget ($B=50$), which favours methods that perform well with few evaluations (jDE) and may disadvantage CMA-ES unless results at larger $B$ are inspected separately, as done here.
+
+%%======================================================================
+\section{Conclusions}\label{sec:conclusions}
+%%======================================================================
+
+We optimized four DLQR weighting parameters of a voltage-source inverter simulator using $(\mu,\lambda)$-ES, jDE, CMA-ES, and a native PSO baseline under shared function-evaluation budgets $B\in\{50,100,200\}$.
+
+The main conclusions are:
+\begin{enumerate}
+  \item \textbf{PSO is descriptively far from the best fitness, but statistical support is partial.} Tuned jDE and CMA-ES beat PSO significantly at $B=100$ and $B=200$ ($n=5$, Holm-corrected); ES does not; at $B=50$ no Holm-significant pairwise result was obtained.
+  \item \textbf{jDE is the most dependable tuned configuration.} It maintains median $\approx0.01826$ across budgets with low spread; Wilcoxon tests show no confirmed improvement when $B$ increases.
+  \item \textbf{CMA-ES works well only after sufficient budget on the tuned config.} It matches jDE at $B\ge100$ in Table~\ref{tab:fitness-tuned}, but pooled results at $B=50$ remain poor.
+  \item \textbf{ES is unreliable under the tuned settings reported.} It is significantly worse than jDE/CMA-ES at larger $B$ and exhibits heavy outliers in grid-wide runs.
+  \item \textbf{Larger $B$ did not yield statistically confirmed gains} on tuned configs (Wilcoxon $p\ge0.06$), although descriptive medians already sit near the apparent simulator floor.
+\end{enumerate}
+
+\paragraph{Practical recommendation.}
+Under the tested sample size, jDE or CMA-ES at $B\ge100$ are the methods with significant evidence of beating tuned PSO; jDE is preferable when stability across seeds matters.
+ES and PSO should not be presented as statistically equivalent to jDE/CMA-ES on fitness, but ES versus PSO was not significantly different here.
+Increasing seeds and rerunning the Holm pipeline would be needed for stronger claims.
+Future work should increase the number of independent seeds, log best-so-far trajectories uniformly across methods, and validate winning controllers with time-domain performance indicators beyond the scalar cost~\eqref{eq:cost}.
+
+%%======================================================================
+\section{Deviations from the initial report}\label{sec:deviations}
+%%======================================================================
+
+The preliminary WdAE document (task~24, VSI + DLQR tuning) defined the research direction: black-box minimization of simulator fitness with evolution strategies, jDE, comparison to PSO, reproducible CSV outputs, and non-parametric statistical testing.
+The final deliverable follows that core idea but differs in several concrete choices driven by integration effort, runtime limits, and what could be completed before the submission deadline.
+Table~\ref{tab:deviations} summarizes the main gaps; the paragraphs below explain rationale and impact on interpretation.
+
+\begin{table}[t]
+\centering
+\caption{Planned versus realized elements of the study (initial WdAE report vs.\ final work).}\label{tab:deviations}
+\footnotesize
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}p{0.26\textwidth} p{0.34\textwidth} p{0.34\textwidth}@{}}
+\toprule
+Topic & Initial plan & Final study \\
+\midrule
+FES budgets $B$ & 1000, 2000, 5000 & 50, 100, 200 \\
+Seeds per configuration & $\ge 30$ & 5 \\
+Algorithms & ES, jDE, PSO & ES, jDE, CMA-ES, PSO \\
+CMA-ES & not listed & added (pycma) \\
+PSO & repo baseline & repaired MATLAB bridge; optional rerun/merge scripts \\
+Extra metrics & THD, overshoot & not done; cost $f$ only \\
+Statistics & Wilcoxon / MW + Holm & \texttt{statistical\_tests.py}; low power \\
+Convergence & best-so-far vs FES & trajectories + optional plots \\
+Experiment driver & --- & \texttt{run\_experiments.py}, parallel pool \\
+\botrule
+\end{tabular}
+\normalsize
+\end{table}
+
+\subsection{Scope and algorithms}
+
+The problem formulation (four log-weights, DLQR + time-domain simulation, penalty for instability) is unchanged from the initial proposal.
+\textbf{CMA-ES was added} as a modern continuous optimizer with covariance adaptation, which was not named in the preliminary document but fits the comparison of derivative-free methods on the same oracle.
+All four algorithms share the FES accounting described in Section~\ref{sec:algorithms}, except PSO, which evaluates $f$ inside MATLAB without the XML-RPC subprocess.
+
+\subsection{Experimental scale}
+
+The largest deliberate deviation is \textbf{experimental scale}.
+The initial report targeted $B\in\{2000,5000\}$ and at least $30$ independent seeds per configuration to support strong inferential claims.
+Final runs used $B\in\{50,100,200\}$ and five seeds because a full $30\times$ grid $\times$ four algorithms would require prohibitive wall-clock time once each fitness call includes DLQR design and $0.3$\,s horizon simulation (Section~\ref{subsec:results-robustness}).
+This directly affects Section~\ref{sec:results}: Holm-corrected tests on tuned configurations are reported honestly as \emph{partially} significant (Section~\ref{subsec:results-tuned}), and conclusions in Section~\ref{sec:conclusions} are phrased accordingly.
+Increasing $B$ and seed count remains the highest-priority follow-up.
+
+Hyperparameter grids were retained in spirit (coarse Cartesian products in \texttt{experiments\_config.txt}) but with smaller ES/$\lambda$ sets and PSO particle counts $\{5,15,30\}$ aligned to low budgets.
+Tuning of representative configs uses $B=50$ rather than the initially suggested $B=1000$.
+
+\subsection{Software engineering changes}
+
+Several components were not described in the initial PDF but were required to obtain the final dataset:
+\begin{itemize}
+  \item \textbf{\texttt{run\_experiments.py}} --- batch runner with \texttt{ProcessPoolExecutor}, progress JSON, CSV summaries, and optional trajectory export;
+  \item \textbf{PSO repair} --- extension of \texttt{PSOMatlabConfig} and \texttt{main.m} to pass $c_1$, $c_2$, $\rho_{\mathrm{rang}}$, and seeds; removal of \texttt{parfor} pool startup that broke log parsing; return of \texttt{best\_fitness} to Python;
+  \item \textbf{\texttt{run\_pso\_only.py}} and \textbf{\texttt{merge\_results.py}} --- auxiliary scripts added when early PSO batches failed or needed replacement in combined tables;
+  \item \textbf{\texttt{plot\_results.py}} / \textbf{\texttt{generate\_report\_plots.py}} and \textbf{\texttt{statistical\_tests.py}} / \textbf{\texttt{run\_report\_statistics.py}} --- reproducible figures and Holm-corrected tests documented in Section~\ref{sec:methodology}.
+\end{itemize}
+Bug fixes to \texttt{compute\_fitness} (robust XML-RPC parsing), ES mutation (NumPy addition), and $\sigma$ clipping were also necessary for stable experiments but were not part of the initial written plan.
+
+\subsection{Analysis and reporting}
+
+The initial document mentioned \textbf{THD and overshoot} analysis for the best controllers.
+That step was deferred: the simulator cost~\eqref{eq:cost} already aggregates tracking and control effort, and extracting additional waveforms would require a separate post-processing pipeline not implemented in time.
+Reporting therefore rests on $f(\mathbf{p})$ and runtime, not on frequency-domain or step-response criteria.
+
+Statistical methodology followed the proposal (Mann--Whitney, Holm, Wilcoxon, Friedman) but results must be read with the reduced $n$.
+We explicitly avoid treating pooled grid-wide tests as confirmatory (Section~\ref{subsec:results-tuned}).
+
+The Springer Nature report template and this deviations section were added for the course deliverable; the initial two-page PDF did not include them.
+
+\subsection{What remained aligned}
+
+Despite the deviations above, the project still:
+\begin{itemize}
+  \item optimizes the same VSI--DLQR simulator and decision vector $\mathbf{p}\in[-10,10]^4$;
+  \item compares evolution strategies, differential evolution, and PSO under explicit FES budgets;
+  \item stores seeds, hyperparameters, fitness, and runtime in CSV for reproduction;
+  \item discusses limitations and does not overstate statistical certainty where $n=5$ is insufficient.
+\end{itemize}
+
+In short, the final study is a \emph{scaled-down but methodologically stricter} realization of the initial plan: broader algorithm coverage, stronger software reproducibility, more cautious statistical wording, and smaller budgets/seeds than originally announced.
+
+%%======================================================================
+\section*{Code availability}
+%%======================================================================
+
+Source code, experiment configuration, and reproduction scripts are available at
+\url{https://github.com/AntoniKingston/VSI-Circuit-Optimalization-Utilizing-Evolutionary-Strategies}.
+The repository \texttt{README.md} describes the full workflow from simulator startup to report figures.
+The course submission may additionally include a \texttt{git} bundle; key entry points are \texttt{run\_experiments.py}, \texttt{generate\_report\_plots.py}, \texttt{run\_report\_statistics.py}, and the MATLAB/Python sources under \texttt{src/} and \texttt{algorithms.py}.
+
+%%======================================================================
+%% Bibliography — populate sn-bibliography.bib as references are added
+%%======================================================================
+
+\bibliography{sn-bibliography}
+
+\end{document}
