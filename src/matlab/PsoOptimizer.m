@@ -57,7 +57,10 @@ classdef PsoOptimizer < handle
       [~, gbest] = min(obj.population_(:, 4, 1));
       obj.best_point_ = gbest;
       gbest_val = obj.population_(obj.best_point_, 4, 1);
-      if mod(iter_num, obj.params_.info_interval) == 0
+      log_now = (iter_num == 1) ...
+          || (iter_num == obj.params_.max_iter) ...
+          || (mod(iter_num, obj.params_.info_interval) == 0);
+      if log_now
           best_solution = squeeze(obj.population_(obj.best_point_, 3, :))';
           disp(['Iteration: ' num2str(iter_num) ...
                 '  Fitness: ' num2str(fitness_values(obj.best_point_)) ...
@@ -94,23 +97,27 @@ classdef PsoOptimizer < handle
       end
     end
 
-    function [best_population_, best_fitness_mat_] = optimize(obj, evaluator)
+    function [best_fitness, best_solution] = optimize(obj, evaluator)
       fitness_values = inf(1, obj.params_.particle_number);
-      rng(1, 'twister');
+      best_fitness = inf;
+      best_solution = zeros(1, obj.dimension_);
       for iter_cnt = 1:obj.params_.max_iter
-          parfor particle_cnt = 1:obj.params_.particle_number
+          for particle_cnt = 1:obj.params_.particle_number
               try
-                  working_point = obj.population_(particle_cnt, :, :);
-                  working_point = squeeze(working_point(1, 1, :));
-                  fitness_wp = evaluator.evaluate(working_point); 
-		  fitness_values(particle_cnt) = fitness_wp;
+                  working_point = squeeze(obj.population_(particle_cnt, 1, :));
+                  fitness_values(particle_cnt) = evaluator.evaluate(working_point);
               catch ME
-		  disp(ME);
+                  disp(ME);
                   fitness_values(particle_cnt) = 1e6;
                   disp(['Evaluation for particle no. ' num2str(particle_cnt) ' was aborted']);
               end
           end
           obj.update_best(iter_cnt, fitness_values);
+          gbest_val = obj.population_(obj.best_point_, 4, 1);
+          if gbest_val < best_fitness
+              best_fitness = gbest_val;
+              best_solution = squeeze(obj.population_(obj.best_point_, 3, :))';
+          end
           obj.update_parameters();
       end
     end

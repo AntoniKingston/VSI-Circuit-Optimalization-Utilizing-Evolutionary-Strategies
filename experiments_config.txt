@@ -10,13 +10,13 @@ detailed_results_file = detailed_results.csv
 summary_file = summary_results.csv
 trajectory_file = trajectories.csv
 save_trajectories = 1
-max_workers = 6
+max_workers = 12
 # By default PSO is serial to avoid contention on shared MATLAB engine.
 parallel_pso = 0
 
 # Experiments
 algorithms = es,jde,cma,pso
-budgets = 1000,2000,5000
+budgets = 50, 100, 200
 seeds = 1,2,3,4,5
 
 # Which summary stats to compute
@@ -27,12 +27,12 @@ client_script_name = client.py
 
 [grid.es]
 mu = 10,20,40
-lamb = 30,100,200
+lamb = 20,50,100
 sigma_0 = 0.1,0.3,0.7
 sigma_sigma = 0.03,0.1,0.2
 
 [grid.jde]
-population_size = 20,40,80
+population_size = 10,20,40
 F_init = 0.4,0.5,0.7
 CR_init = 0.5,0.8,0.9
 tau = 0.05,0.1,0.2
@@ -42,7 +42,7 @@ sigma_0 = 0.1,0.3,0.5
 popsize = 8,16
 
 [grid.pso]
-particle_number = 20,40,80
+particle_number = 5,15,30
 info_interval = 10
 c1 = 1.7,2.05,2.5
 c2 = 1.5,2.05

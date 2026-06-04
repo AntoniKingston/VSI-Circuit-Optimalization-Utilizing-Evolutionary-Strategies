@@ -189,12 +189,12 @@ def _run_pso(seed: int, budget: int, cfg: Dict[str, Any], client_script_name: st
     pso_cfg = PSOMatlabConfig(
         max_iter=max_iter,
         particle_number=particle_number,
-        opt_info_interval=int(cfg["info_interval"]),
-        c1=float(cfg["c1"]),
-        c2=float(cfg["c2"]),
-        rang_coef=float(cfg["rang_coef"]),
-        random_seed=seed,
-        echo_logs=bool(int(cfg["echo_logs"])),
+        opt_info_interval=int(cfg.get("info_interval", cfg.get("opt_info_interval", 10))),
+        c1=float(cfg.get("c1", 2.05)),
+        c2=float(cfg.get("c2", 2.05)),
+        rang_coef=float(cfg.get("rang_coef", 0.6)),
+        random_seed=int(seed),
+        echo_logs=bool(int(cfg.get("echo_logs", 0))),
     )
     start = time.perf_counter()
     best_f, logs = optimize_pso_matlab(pso_cfg)

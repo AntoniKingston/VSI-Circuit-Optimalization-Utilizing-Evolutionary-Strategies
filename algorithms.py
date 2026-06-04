@@ -342,11 +342,21 @@ class PSOMatlabConfig:
     max_iter: int = 50
     particle_number: int = 100
     opt_info_interval: int = 10
+    c1: float = 2.05
+    c2: float = 2.05
+    rang_coef: float = 0.6
+    random_seed: Optional[int] = None
     echo_logs: bool = True
 
     def __post_init__(self):
         if self.matlab_flags is None:
             self.matlab_flags = ["-nodesktop", "-nosplash", "-nojvm", "-batch"]
+
+    def matlab_seed_arg(self) -> float:
+        """MATLAB main() uses a negative value to mean 'do not fix the RNG seed'."""
+        if self.random_seed is None:
+            return -1.0
+        return float(self.random_seed)
 
 
 def optimize_cma_es(config: CMAESConfig) -> Tuple[float, List[float]]:
@@ -389,15 +399,32 @@ def optimize_cma_es(config: CMAESConfig) -> Tuple[float, List[float]]:
     return float(es.result.fbest), best_solution
 
 
+def _parse_pso_best_fitness(log_text: str) -> Optional[float]:
+    final_match = re.search(
+        r"PSO_FINAL_FITNESS:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
+        log_text,
+    )
+    if final_match:
+        return float(final_match.group(1))
+    fitness_matches = re.findall(
+        r"Fitness\(best\):\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
+        log_text,
+    )
+    if fitness_matches:
+        return float(fitness_matches[-1])
+    return None
+
+
 def optimize_pso_matlab(config: PSOMatlabConfig) -> Tuple[float, str]:
     """
     Run MATLAB PSO optimizer from src/matlab and return best fitness and full stdout.
 
-    The function expects PSO logs to contain lines like:
-    'Iteration: <k>  Fitness: <...> Fitness(best): <value>'
+    Best fitness is taken from the function return value when available, otherwise
+    parsed from ``PSO_FINAL_FITNESS`` or ``Fitness(best):`` log lines.
     """
     source_dir = str((Path(config.working_directory) / config.matlab_source_dir).resolve())
     captured_stdout = ""
+    best_from_engine: Optional[float] = None
 
     class _TeeWriter(io.StringIO):
         def __init__(self, stream):
@@ -422,15 +449,32 @@ def optimize_pso_matlab(config: PSOMatlabConfig) -> Tuple[float, str]:
             out_tee = _TeeWriter(sys.stdout)
             err_tee = _TeeWriter(sys.stderr)
             eng.cd(source_dir, nargout=0)
-            eng.feval(
-                config.matlab_script_name,
+            matlab_args = (
                 int(config.max_iter),
                 int(config.particle_number),
                 int(config.opt_info_interval),
-                nargout=0,
-                stdout=out_tee,
-                stderr=err_tee,
+                float(config.c1),
+                float(config.c2),
+                float(config.rang_coef),
+                config.matlab_seed_arg(),
             )
+            try:
+                result = eng.feval(
+                    config.matlab_script_name,
+                    *matlab_args,
+                    nargout=1,
+                    stdout=out_tee,
+                    stderr=err_tee,
+                )
+                best_from_engine = float(result)
+            except Exception:
+                eng.feval(
+                    config.matlab_script_name,
+                    *matlab_args,
+                    nargout=0,
+                    stdout=out_tee,
+                    stderr=err_tee,
+                )
             stdout = out_tee.getvalue()
             captured_stdout = stdout
         except Exception as err:
@@ -445,7 +489,9 @@ def optimize_pso_matlab(config: PSOMatlabConfig) -> Tuple[float, str]:
         batch_expr = (
             f"cd('{source_dir}'); "
             f"{config.matlab_script_name}({int(config.max_iter)},"
-            f"{int(config.particle_number)},{int(config.opt_info_interval)})"
+            f"{int(config.particle_number)},{int(config.opt_info_interval)},"
+            f"{float(config.c1)},{float(config.c2)},{float(config.rang_coef)},"
+            f"{config.matlab_seed_arg()})"
         )
         cmd = [config.matlab_command, *flags, batch_expr]
         result = subprocess.run(
@@ -461,15 +507,19 @@ def optimize_pso_matlab(config: PSOMatlabConfig) -> Tuple[float, str]:
         if config.echo_logs and stdout:
             print(stdout, end="")
 
-    fitness_matches = re.findall(r"Fitness\(best\):\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", captured_stdout)
     if returncode != 0:
         raise RuntimeError(
             "MATLAB PSO execution failed. "
             f"returncode={returncode} | stdout={stdout!r} | stderr={stderr!r}"
         )
-    if not fitness_matches:
+
+    best_fitness = best_from_engine
+    if best_fitness is None:
+        best_fitness = _parse_pso_best_fitness(captured_stdout)
+    if best_fitness is None:
         raise RuntimeError(
-            "MATLAB PSO execution succeeded but no 'Fitness(best)' was found in logs. "
+            "MATLAB PSO finished but best fitness could not be determined. "
+            "Expected function output, 'PSO_FINAL_FITNESS', or 'Fitness(best)' in logs. "
             f"stdout={stdout!r} | stderr={stderr!r}"
         )
-    return float(fitness_matches[-1]), captured_stdout
+    return float(best_fitness), captured_stdout
